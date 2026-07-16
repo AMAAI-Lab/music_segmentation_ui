@@ -1,0 +1,16 @@
+# Virtual environments
+segmentation_env/
+segmentation_env_311/
+
+# Caches
+processed_cache/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Allin1 intermediate files
+demix/
+
+# macOS
+.DS_Store
