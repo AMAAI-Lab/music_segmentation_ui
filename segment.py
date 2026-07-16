@@ -365,6 +365,66 @@ def seg_allin1(audio_path: Path) -> Optional[np.ndarray]:
 
 
 # ─────────────────────────────────────────────
+# HYBRID: Allin1 + Agglomerative
+# ─────────────────────────────────────────────
+
+def seg_hybrid(allin1_bounds: list, agglom_bounds: list, duration: float,
+               long_thresh: float = 30.0,
+               tiny_thresh: float = 8.0,
+               snap_radius: float = 15.0) -> Optional[np.ndarray]:
+    """Refine Allin1 boundaries using Agglomerative's 'tiny section' pattern.
+
+    Observation: Agglomerative often produces one very long span followed by a
+    tiny transitional section. The *end* of that tiny section is a reliable
+    structural boundary even when Allin1 places its nearest boundary slightly
+    off. This function snaps the closest Allin1 boundary to the Agglomerative
+    candidate, or inserts it if no Allin1 boundary is nearby.
+
+    Args:
+        long_thresh: segment duration (s) to qualify as 'long'
+        tiny_thresh: segment duration (s) to qualify as 'tiny'
+        snap_radius: max distance (s) to snap an Allin1 boundary to a candidate
+    """
+    if not allin1_bounds or not agglom_bounds:
+        return None
+
+    a1 = np.array(allin1_bounds)
+    ag = np.array(agglom_bounds)
+    ag_durs = np.diff(ag)
+
+    # Find tiny sections preceded by a long section
+    candidates = []
+    for i in range(1, len(ag_durs)):
+        if ag_durs[i - 1] >= long_thresh and ag_durs[i] <= tiny_thresh:
+            # End of the tiny section = reliable boundary
+            candidates.append(float(ag[i + 1]))
+
+    if not candidates:
+        # No pattern found — return Allin1 unchanged
+        return _ensure_boundaries(a1, duration)
+
+    # Inner Allin1 boundaries (exclude 0.0 and duration)
+    result = list(a1[1:-1])
+
+    for cand in candidates:
+        if not result:
+            result.append(cand)
+            continue
+        dists = [abs(cand - b) for b in result]
+        min_dist = min(dists)
+        if min_dist <= snap_radius:
+            # Snap: replace the nearest Allin1 boundary
+            result[dists.index(min_dist)] = cand
+        else:
+            # Insert: Allin1 has no boundary nearby — add it
+            result.append(cand)
+
+    result = sorted(set(round(t, 4) for t in result))
+    print(f"    Hybrid: {len(candidates)} Agglom candidate(s) applied")
+    return _ensure_boundaries(np.array(result), duration)
+
+
+# ─────────────────────────────────────────────
 # PIPELINE
 # ─────────────────────────────────────────────
 CORE_ALGOS = {
@@ -378,15 +438,50 @@ CORE_ALGOS = {
 MSAF_IDS = ["foote", "scluster", "olda", "cnmf", "2dftm"]
 
 
-def process_file(fname: str, audio_path: Path, force: bool) -> dict:
-    """Load audio, run all algorithms, return result dict (cache-aware)."""
-    cached = None if force else load_cache(fname, audio_path)
+def _compute_hybrid(algos: dict, duration: float) -> None:
+    """Compute Hybrid (Allin1+Agglom) in-place into algos dict, if possible."""
+    if "Allin1 (SOTA)" in algos and "Agglomerative" in algos:
+        b = seg_hybrid(algos["Allin1 (SOTA)"], algos["Agglomerative"], duration)
+        if b is not None:
+            algos["Hybrid (Allin1+Agglom)"] = [round(float(v), 4) for v in b]
+            print(f"  ✓ Hybrid (Allin1+Agglom): {len(b)-1} segment(s)")
+    else:
+        missing = [k for k in ("Allin1 (SOTA)", "Agglomerative") if k not in algos]
+        print(f"  – Hybrid skipped (missing: {', '.join(missing)})")
 
-    if cached and "algorithms" in cached:
+
+def process_file(fname: str, audio_path: Path, force: bool,
+                 hybrid_only: bool = False) -> dict:
+    """Load audio, run all algorithms, return result dict (cache-aware).
+
+    hybrid_only: skip all base algorithms; only (re-)compute the Hybrid row
+                 from already-cached Allin1 and Agglomerative results.
+    """
+    cached = load_cache(fname, audio_path)
+
+    if hybrid_only:
+        if cached and "algorithms" in cached:
+            algos    = cached["algorithms"]
+            waveform = cached.get("waveform", [])
+            duration = cached.get("duration", 0.0)
+            print(f"  (hybrid-only) updating from cache…")
+            _compute_hybrid(algos, duration)
+            save_cache(fname, audio_path,
+                       {"duration": duration, "waveform": waveform, "algorithms": algos})
+        else:
+            print(f"  ✗ No cache found — run without --hybrid-only first")
+            algos, waveform, duration = {}, [], 0.0
+        return {"duration": duration, "waveform": waveform, "algorithms": algos}
+
+    if not force and cached and "algorithms" in cached:
         print(f"  ✓ Loaded from cache")
-        algos = cached["algorithms"]
+        algos    = cached["algorithms"]
         waveform = cached.get("waveform", [])
         duration = cached.get("duration", 0.0)
+        # Always refresh the hybrid in case parameters changed
+        _compute_hybrid(algos, duration)
+        save_cache(fname, audio_path,
+                   {"duration": duration, "waveform": waveform, "algorithms": algos})
     else:
         y, sr = librosa.load(str(audio_path), sr=SR_TARGET, mono=True)
         duration = float(librosa.get_duration(y=y, sr=sr))
@@ -425,8 +520,11 @@ def process_file(fname: str, audio_path: Path, force: bool) -> dict:
             algos["Allin1 (SOTA)"] = [round(float(v), 4) for v in b]
             print(f"  ✓ Allin1: {len(b)-1} segment(s)")
 
-        data = {"duration": duration, "waveform": waveform, "algorithms": algos}
-        save_cache(fname, audio_path, data)
+        # Hybrid (depends on Allin1 + Agglomerative)
+        _compute_hybrid(algos, duration)
+
+        save_cache(fname, audio_path,
+                   {"duration": duration, "waveform": waveform, "algorithms": algos})
 
     return {"duration": duration, "waveform": waveform, "algorithms": algos}
 
@@ -437,6 +535,9 @@ def process_file(fname: str, audio_path: Path, force: bool) -> dict:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", action="store_true", help="Ignore cache, recompute all")
+    parser.add_argument("--hybrid-only", action="store_true",
+                        help="Only (re-)compute Hybrid (Allin1+Agglom) from cached data; "
+                             "skip all other algorithms")
     args = parser.parse_args()
 
     print("=" * 50)
@@ -478,7 +579,8 @@ def main():
         print(f"\n{fname}:")
         all_data[fname] = {
             "url": f"audio/{fname}.mp3",
-            **process_file(fname, path, args.force),
+            **process_file(fname, path, args.force,
+                           hybrid_only=args.hybrid_only),
         }
 
     RESULTS_FILE.write_text(json.dumps(all_data, indent=2))
