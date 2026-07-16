@@ -369,8 +369,9 @@ def seg_allin1(audio_path: Path) -> Optional[np.ndarray]:
 # ─────────────────────────────────────────────
 
 def seg_hybrid(allin1_bounds: list, agglom_bounds: list, duration: float,
+               bpm: Optional[float] = None,
                long_thresh: float = 30.0,
-               tiny_thresh: float = 8.0,
+               tiny_beats: float = 32.0,
                snap_radius: float = 15.0) -> Optional[np.ndarray]:
     """Refine Allin1 boundaries using Agglomerative's 'tiny section' pattern.
 
@@ -380,13 +381,25 @@ def seg_hybrid(allin1_bounds: list, agglom_bounds: list, duration: float,
     off. This function snaps the closest Allin1 boundary to the Agglomerative
     candidate, or inserts it if no Allin1 boundary is nearby.
 
+    The 'tiny' threshold is tempo-relative: a section counts as tiny when it is
+    at most `tiny_beats` beats long, i.e. tiny_thresh = tiny_beats * 60 / bpm.
+    32 beats ≈ 8 bars in 4/4 — beyond that a section is too long to be a mere
+    transition. If bpm is unavailable, it falls back to a fixed 8.0 s.
+
     Args:
+        bpm:         song tempo in BPM (drives the tiny threshold)
         long_thresh: segment duration (s) to qualify as 'long'
-        tiny_thresh: segment duration (s) to qualify as 'tiny'
+        tiny_beats:  max length in BEATS for a section to count as 'tiny'
         snap_radius: max distance (s) to snap an Allin1 boundary to a candidate
     """
     if not allin1_bounds or not agglom_bounds:
         return None
+
+    # Tempo-relative 'tiny' threshold (seconds); fall back to 8.0 s w/o tempo.
+    if bpm and bpm > 0:
+        tiny_thresh = tiny_beats * 60.0 / bpm
+    else:
+        tiny_thresh = 8.0
 
     a1 = np.array(allin1_bounds)
     ag = np.array(agglom_bounds)
@@ -420,7 +433,8 @@ def seg_hybrid(allin1_bounds: list, agglom_bounds: list, duration: float,
             result.append(cand)
 
     result = sorted(set(round(t, 4) for t in result))
-    print(f"    Hybrid: {len(candidates)} Agglom candidate(s) applied")
+    tag = f"tiny≤{tiny_thresh:.1f}s" + (f" @ {bpm:.0f} BPM" if bpm else " (fixed)")
+    print(f"    Hybrid: {len(candidates)} Agglom candidate(s) applied ({tag})")
     return _ensure_boundaries(np.array(result), duration)
 
 
@@ -438,10 +452,25 @@ CORE_ALGOS = {
 MSAF_IDS = ["foote", "scluster", "olda", "cnmf", "2dftm"]
 
 
-def _compute_hybrid(algos: dict, duration: float) -> None:
+def _tempo_bpm(y, sr) -> float:
+    """Global tempo (BPM) estimate via librosa beat tracking."""
+    t = librosa.beat.beat_track(y=y, sr=sr, hop_length=HOP_LENGTH)[0]
+    return float(np.atleast_1d(t)[0])
+
+
+def _ensure_tempo(cached: Optional[dict], audio_path: Path) -> float:
+    """Return the cached tempo, or compute it from the audio if not cached."""
+    bpm = (cached or {}).get("tempo")
+    if bpm:
+        return float(bpm)
+    y, sr = librosa.load(str(audio_path), sr=SR_TARGET, mono=True)
+    return _tempo_bpm(y, sr)
+
+
+def _compute_hybrid(algos: dict, duration: float, bpm: Optional[float] = None) -> None:
     """Compute Hybrid (Allin1+Agglom) in-place into algos dict, if possible."""
     if "Allin1 (SOTA)" in algos and "Agglomerative" in algos:
-        b = seg_hybrid(algos["Allin1 (SOTA)"], algos["Agglomerative"], duration)
+        b = seg_hybrid(algos["Allin1 (SOTA)"], algos["Agglomerative"], duration, bpm=bpm)
         if b is not None:
             algos["Hybrid (Allin1+Agglom)"] = [round(float(v), 4) for v in b]
             print(f"  ✓ Hybrid (Allin1+Agglom): {len(b)-1} segment(s)")
@@ -464,27 +493,34 @@ def process_file(fname: str, audio_path: Path, force: bool,
             algos    = cached["algorithms"]
             waveform = cached.get("waveform", [])
             duration = cached.get("duration", 0.0)
-            print(f"  (hybrid-only) updating from cache…")
-            _compute_hybrid(algos, duration)
+            bpm      = _ensure_tempo(cached, audio_path)
+            print(f"  (hybrid-only) updating from cache… ({bpm:.1f} BPM)")
+            _compute_hybrid(algos, duration, bpm)
             save_cache(fname, audio_path,
-                       {"duration": duration, "waveform": waveform, "algorithms": algos})
+                       {"duration": duration, "tempo": bpm,
+                        "waveform": waveform, "algorithms": algos})
         else:
             print(f"  ✗ No cache found — run without --hybrid-only first")
-            algos, waveform, duration = {}, [], 0.0
-        return {"duration": duration, "waveform": waveform, "algorithms": algos}
+            algos, waveform, duration, bpm = {}, [], 0.0, None
+        return {"duration": duration, "tempo": bpm,
+                "waveform": waveform, "algorithms": algos}
 
     if not force and cached and "algorithms" in cached:
         print(f"  ✓ Loaded from cache")
         algos    = cached["algorithms"]
         waveform = cached.get("waveform", [])
         duration = cached.get("duration", 0.0)
+        bpm      = _ensure_tempo(cached, audio_path)
         # Always refresh the hybrid in case parameters changed
-        _compute_hybrid(algos, duration)
+        _compute_hybrid(algos, duration, bpm)
         save_cache(fname, audio_path,
-                   {"duration": duration, "waveform": waveform, "algorithms": algos})
+                   {"duration": duration, "tempo": bpm,
+                    "waveform": waveform, "algorithms": algos})
     else:
         y, sr = librosa.load(str(audio_path), sr=SR_TARGET, mono=True)
         duration = float(librosa.get_duration(y=y, sr=sr))
+        bpm = _tempo_bpm(y, sr)
+        print(f"  tempo: {bpm:.1f} BPM")
 
         # Downsampled waveform for viewer
         y_ds = np.interp(np.linspace(0, 1, WAVEFORM_PTS), np.linspace(0, 1, len(y)), y)
@@ -521,12 +557,14 @@ def process_file(fname: str, audio_path: Path, force: bool,
             print(f"  ✓ Allin1: {len(b)-1} segment(s)")
 
         # Hybrid (depends on Allin1 + Agglomerative)
-        _compute_hybrid(algos, duration)
+        _compute_hybrid(algos, duration, bpm)
 
         save_cache(fname, audio_path,
-                   {"duration": duration, "waveform": waveform, "algorithms": algos})
+                   {"duration": duration, "tempo": bpm,
+                    "waveform": waveform, "algorithms": algos})
 
-    return {"duration": duration, "waveform": waveform, "algorithms": algos}
+    return {"duration": duration, "tempo": bpm,
+            "waveform": waveform, "algorithms": algos}
 
 
 # ─────────────────────────────────────────────

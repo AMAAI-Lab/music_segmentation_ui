@@ -210,6 +210,55 @@ boundaries may be slightly fewer than `n_segments` after label smoothing.
 | `k` | Laplacian | Target cluster/section count; also controls eigenvector depth |
 | `bandwidth` | Laplacian | Recurrence graph connectivity — lower = stricter similarity |
 | `n_segments` | Agglomerative, Spectral | Target section count |
+| `tiny_beats` | Hybrid | Max length (in **beats**) for a section to count as a transition; tempo-relative (`32 * 60 / bpm`) |
+
+---
+
+## Verifying the Hybrid — `test_hybrid.py`
+
+`test_hybrid.py` is a small stand-alone checker for the **Hybrid (Allin1+Agglom)**
+algorithm. The Hybrid's "tiny section" cutoff is **tempo-relative**: a section
+counts as a transition when it is at most **32 beats** long
+(`tiny_thresh = 32 * 60 / bpm`, ≈ 8 bars in 4/4), rather than a fixed number of
+seconds. This script shows, per song, how that tempo-aware threshold changes the
+Hybrid boundaries versus the old fixed-8 s rule.
+
+It reuses the **cached** `Allin1 (SOTA)` and `Agglomerative` boundaries already in
+`results.json`, so it does **not** need Allin1 (or its brittle natten/torch stack)
+to run — only librosa and the audio files. This is the recommended way to iterate
+on the Hybrid without a working Allin1 install.
+
+### Run it
+
+```bash
+source segmentation_env_311/bin/activate     # or your own venv
+python test_hybrid.py            # print-only: BPM + old vs new boundaries
+python test_hybrid.py --write    # also patch the new Hybrid rows into results.json
+```
+
+For each song it prints the librosa-detected BPM, the old (fixed 8 s) threshold vs
+the new (32-beat) threshold, both boundary lists, and whether the Hybrid changed.
+
+### See it in the dashboard
+
+```bash
+python test_hybrid.py --write    # required — writes the new Hybrid to results.json
+python -m http.server 8080
+# open http://localhost:8080/viewer.html
+```
+
+Without `--write` the script computes the new Hybrid but discards it after
+printing, so the dashboard would look unchanged.
+
+> **Requirements:** `results.json` must already contain `Allin1 (SOTA)` and
+> `Agglomerative` rows for each song (they ship pre-computed). Tempo is detected
+> from the files in `audio/`, so those must be present (`python segment.py`
+> downloads them on first run).
+
+> **Tuning:** the beat count lives in `seg_hybrid(..., tiny_beats=32)` in
+> `segment.py`. Raise it (e.g. 33–34) to treat slightly longer sections as
+> transitions; lower it to be stricter. BPM is estimated with librosa and may
+> occasionally be an octave off (½× or 2×) — sanity-check the printed value.
 
 ---
 
